@@ -17,13 +17,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ================= 第二阶段：提前验证签名 =================
+      # ================= 第二阶段：配置 Java =================
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
+      # ================= 第三阶段：编译前验证签名密钥 =================
       - name: Validate Signing Keystore BEFORE BUILD
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
@@ -59,7 +60,7 @@ jobs:
 
           echo "========== Base64 解码 =========="
 
-          KS="$RUNNER_TEMP/HGhub-release.jks"
+          KS="$RUNNER_TEMP/HGhub-release.p12"
 
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KS"
 
@@ -70,26 +71,36 @@ jobs:
 
           echo "密钥文件大小：$(wc -c < "$KS") bytes"
 
-          echo "========== 检查密钥库 =========="
+          echo "========== 检查 PKCS12 密钥库 =========="
 
           keytool -list \
+            -storetype PKCS12 \
             -keystore "$KS" \
             -storepass "$STORE_PASSWORD" \
             -alias "$KEY_ALIAS"
 
-          echo "========== 检查私钥密码 =========="
+          echo "========== 验证私钥密码 =========="
 
-          keytool -keypasswd \
-            -keystore "$KS" \
-            -alias "$KEY_ALIAS" \
-            -storepass "$STORE_PASSWORD" \
-            -keypass "$KEY_PASSWORD" \
-            -new "$KEY_PASSWORD" \
+          keytool -importkeystore \
+            -srckeystore "$KS" \
+            -srcstoretype PKCS12 \
+            -srcstorepass "$STORE_PASSWORD" \
+            -srcalias "$KEY_ALIAS" \
+            -srckeypass "$KEY_PASSWORD" \
+            -destkeystore "$RUNNER_TEMP/verify.p12" \
+            -deststoretype PKCS12 \
+            -deststorepass "$STORE_PASSWORD" \
+            -destkeypass "$KEY_PASSWORD" \
+            -destalias verify \
             -noprompt
 
           echo "========== 签名密钥验证成功 =========="
 
-      # ================= 第三阶段：配置编译环境 =================
+          rm -f "$RUNNER_TEMP/verify.p12"
+
+          echo "KEYSTORE_PATH=$KS" >> "$GITHUB_ENV"
+
+      # ================= 第四阶段：配置 Node 和 pnpm =================
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -100,6 +111,7 @@ jobs:
         with:
           version: 10
 
+      # ================= 第五阶段：配置 Android SDK / NDK =================
       - name: Setup Android SDK and NDK
         run: |
           set -euo pipefail
@@ -121,23 +133,25 @@ jobs:
 
           echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
 
+      # ================= 第六阶段：配置 Rust =================
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
 
+      # ================= 第七阶段：安装项目依赖 =================
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # ================= 第四阶段：初始化 Android =================
+      # ================= 第八阶段：初始化 Android =================
       - name: Initialize Android project
         run: pnpm tauri android init --ci
 
-      # ================= 第五阶段：编译 APK =================
+      # ================= 第九阶段：编译 ARM64 APK =================
       - name: Build ARM64 APK
         run: pnpm tauri android build --apk --split-per-abi --target aarch64
 
-      # ================= 第六阶段：APK 签名 =================
+      # ================= 第十阶段：签名 APK =================
       - name: Sign ARM64 APK
         env:
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -147,7 +161,6 @@ jobs:
           set -euo pipefail
 
           BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
-
           APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
 
           APK="$(find src-tauri/gen/android/app/build/outputs/apk \
@@ -163,7 +176,8 @@ jobs:
           echo "待签名 APK：$APK"
 
           "$APKSIGNER" sign \
-            --ks "$RUNNER_TEMP/HGhub-release.jks" \
+            --ks "$KEYSTORE_PATH" \
+            --ks-type PKCS12 \
             --ks-key-alias "$KEY_ALIAS" \
             --ks-pass "pass:$STORE_PASSWORD" \
             --key-pass "pass:$KEY_PASSWORD" \
@@ -182,7 +196,7 @@ jobs:
 
           ls -lh artifacts/
 
-      # ================= 第七阶段：上传 APK =================
+      # ================= 第十一阶段：上传 APK =================
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -191,9 +205,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # ================= 第八阶段：清理密钥 =================
+      # ================= 第十二阶段：清理密钥 =================
       - name: Cleanup Signing Keystore
         if: always()
         run: |
-          rm -f "$RUNNER_TEMP/HGhub-release.jks"
-          echo "临时签名密钥已清理"
+          rm -f "$RUNNER_TEMP/HGhub-release.p12"
+          rm -f "$RUNNER_TEMP/verify.p12"
+          echo "临时密钥文件已清理"
