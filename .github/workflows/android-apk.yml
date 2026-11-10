@@ -60,24 +60,24 @@ jobs:
         run: pnpm tauri android build --apk --split-per-abi --target aarch64
 
       - name: Sign APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
-          KS="$RUNNER_TEMP/hghub.keystore"
-          PASS="HGhubTempBuild2026"
+          test -n "$KEYSTORE_BASE64"
+          test -n "$KEY_ALIAS"
+          test -n "$STORE_PASSWORD"
+          test -n "$KEY_PASSWORD"
 
-          keytool -genkeypair -noprompt \
-            -keystore "$KS" \
-            -alias hghub \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -storepass "$PASS" \
-            -keypass "$PASS" \
-            -dname "CN=HGhub"
+          KS="$RUNNER_TEMP/release.keystore"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
 
-          BT="$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
-          SIGNER="$ANDROID_HOME/build-tools/$BT/apksigner"
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
 
           mkdir -p artifacts
           APK="$(find src-tauri/gen/android/app/build/outputs/apk \
@@ -85,15 +85,19 @@ jobs:
 
           test -n "$APK"
 
-          "$SIGNER" sign \
+          "$APKSIGNER" sign \
             --ks "$KS" \
-            --ks-key-alias hghub \
-            --ks-pass "pass:$PASS" \
-            --key-pass "pass:$PASS" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$STORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --v4-signing-enabled false \
             --out artifacts/HGhub-ARM64.apk \
             "$APK"
 
-          "$SIGNER" verify artifacts/HGhub-ARM64.apk
+          "$APKSIGNER" verify --verbose artifacts/HGhub-ARM64.apk
+
+          rm -f "$KS"
+          ls -lh artifacts
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
