@@ -1,0 +1,104 @@
+
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          "$SDKM" --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Initialize Android
+        run: pnpm tauri android init --ci
+
+      - name: Build ARM64 APK
+        run: pnpm tauri android build --apk --split-per-abi --target aarch64
+
+      - name: Sign APK
+        run: |
+          set -euo pipefail
+
+          KS="$RUNNER_TEMP/hghub.keystore"
+          PASS="HGhubTempBuild2026"
+
+          keytool -genkeypair -noprompt \
+            -keystore "$KS" \
+            -alias hghub \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass "$PASS" \
+            -keypass "$PASS" \
+            -dname "CN=HGhub"
+
+          BT="$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          SIGNER="$ANDROID_HOME/build-tools/$BT/apksigner"
+
+          mkdir -p artifacts
+          APK="$(find src-tauri/gen/android/app/build/outputs/apk \
+            -type f -name '*release*.apk' | head -1)"
+
+          test -n "$APK"
+
+          "$SIGNER" sign \
+            --ks "$KS" \
+            --ks-key-alias hghub \
+            --ks-pass "pass:$PASS" \
+            --key-pass "pass:$PASS" \
+            --out artifacts/HGhub-ARM64.apk \
+            "$APK"
+
+          "$SIGNER" verify artifacts/HGhub-ARM64.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-ARM64-APK
+          path: artifacts/HGhub-ARM64.apk
+          if-no-files-found: error
+          retention-days: 7
