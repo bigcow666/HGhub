@@ -9,13 +9,14 @@ permissions:
 
 jobs:
   android:
+    name: Build HGhub ARM64 APK
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -31,18 +32,25 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK
+      - name: Setup Android SDK and NDK
         run: |
+          set -euo pipefail
+
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
           SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+
           yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+
           "$SDKM" --install \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "ndk;28.2.13676358"
+
           echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
 
       - name: Setup Rust
@@ -53,13 +61,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Initialize Android
+      - name: Initialize Android project
         run: pnpm tauri android init --ci
 
       - name: Build ARM64 APK
         run: pnpm tauri android build --apk --split-per-abi --target aarch64
 
-      - name: Sign APK
+      - name: Check and decode signing keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -68,25 +76,70 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -n "$KEYSTORE_BASE64"
-          test -n "$KEY_ALIAS"
-          test -n "$STORE_PASSWORD"
-          test -n "$KEY_PASSWORD"
+          test -n "$KEYSTORE_BASE64" || {
+            echo "::error::ANDROID_KEY_BASE64 is empty"
+            exit 1
+          }
 
-          KS="$RUNNER_TEMP/release.keystore"
-          echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+          test -n "$KEY_ALIAS" || {
+            echo "::error::ANDROID_KEY_ALIAS is empty"
+            exit 1
+          }
+
+          test -n "$STORE_PASSWORD" || {
+            echo "::error::ANDROID_KEYSTORE_PASSWORD is empty"
+            exit 1
+          }
+
+          test -n "$KEY_PASSWORD" || {
+            echo "::error::ANDROID_KEY_PASSWORD is empty"
+            exit 1
+          }
+
+          KS="$RUNNER_TEMP/HGhub-release.jks"
+
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KS"
+
+          test -s "$KS" || {
+            echo "::error::Decoded keystore is empty"
+            exit 1
+          }
+
+          echo "Keystore decoded successfully"
+          echo "Keystore size: $(wc -c < "$KS") bytes"
+
+          keytool -list \
+            -keystore "$KS" \
+            -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS"
+
+          echo "KEYSTORE_PATH=$KS" >> "$GITHUB_ENV"
+
+      - name: Sign ARM64 APK
+        env:
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
 
           BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
           APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
 
-          mkdir -p artifacts
-          APK="$(find src-tauri/gen/android/app/build/outputs/apk \
+          APK_DIR="src-tauri/gen/android/app/build/outputs/apk"
+
+          APK="$(find "$APK_DIR" \
             -type f -name '*release*.apk' | head -1)"
 
-          test -n "$APK"
+          test -n "$APK" || {
+            echo "::error::Release APK not found"
+            exit 1
+          }
+
+          mkdir -p artifacts
 
           "$APKSIGNER" sign \
-            --ks "$KS" \
+            --ks "$KEYSTORE_PATH" \
             --ks-key-alias "$KEY_ALIAS" \
             --ks-pass "pass:$STORE_PASSWORD" \
             --key-pass "pass:$KEY_PASSWORD" \
@@ -94,10 +147,13 @@ jobs:
             --out artifacts/HGhub-ARM64.apk \
             "$APK"
 
-          "$APKSIGNER" verify --verbose artifacts/HGhub-ARM64.apk
+          "$APKSIGNER" verify \
+            --verbose \
+            --print-certs \
+            artifacts/HGhub-ARM64.apk
 
-          rm -f "$KS"
-          ls -lh artifacts
+          echo "APK signing successful"
+          ls -lh artifacts/
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -106,3 +162,8 @@ jobs:
           path: artifacts/HGhub-ARM64.apk
           if-no-files-found: error
           retention-days: 7
+
+      - name: Cleanup signing keystore
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/HGhub-release.jks"
